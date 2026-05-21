@@ -1,0 +1,148 @@
+#!/usr/bin/env bash
+#
+# Automate local HTTPS development domains with Caddy.
+
+set -euo pipefail
+
+MODE_LEGACY=0
+CADDY_CONFIG_DIR="${HOME}/.config/caddy"
+CADDY_CONFIG_SITES_ENABLED_DIR="${CADDY_CONFIG_DIR}/sites-enabled"
+
+usage() {
+  echo "
+Usage: caddy-devserver <enable|disable> [FILE]
+
+Automate local HTTPS development domains with Caddy.
+
+EXAMPLE
+
+     caddy-devserver enable # interactively with fzf
+     caddy-devserver enable ./myapp.localhost.Caddyfile
+     caddy-devserver enable /path/to/myapp.localhost.Caddyfile
+
+     caddy-devserver disable # interactively with fzf
+     caddy-devserver disable myapp.localhost
+     caddy-devserver disable ./myapp.localhost.Caddyfile
+     caddy-devserver disable /path/to/myapp.localhost.Caddyfile
+"
+}
+
+is_legacy_mode() { [[ "$MODE_LEGACY" -eq 1 ]]; }
+
+require_installed_command() {
+  local cmd="$1"
+
+  if ! command -v "$cmd" &>/dev/null; then
+    echo "FATAL: command \"$cmd\" is required to run this script" >&2
+    return 1
+  fi
+}
+
+append_domain_to_hosts_file() {
+  local domain="$1"
+
+  local hosts_file="/etc/hosts"
+  local marker="# added by caddy-devserver"
+
+  if awk -v domain="$domain" '
+    $1 == "127.0.0.1" {
+      for (i = 2; i <= NF; i++) {
+        if ($i == domain) found = 1
+      }
+    }
+    END { exit !found }
+  ' "$hosts_file"; then
+    return 0
+  fi
+
+  printf '\n%s\n127.0.0.1 %s\n' "$marker" "$domain" |
+    sudo tee -a "$hosts_file" >/dev/null
+}
+
+list_domains() {
+  find "${CADDY_CONFIG_SITES_ENABLED_DIR}" -type f -name '*.Caddyfile' -print0 |
+    while IFS= read -r -d '' file; do
+      file="${file##*/}"
+      printf '%s\n' "${file%.Caddyfile}"
+    done
+}
+
+mkcert_for_domain() {
+  local domain="$1"
+
+  cd "${CADDY_CONFIG_SITES_ENABLED_DIR}"
+
+  local cert="${domain}.pem"
+  local key="${domain}-key.pem"
+  local fullchain="${domain}-fullchain.pem"
+
+  if [[ -f "${cert}" && -f "${key}" && -f "${fullchain}" ]]; then
+    echo "Check existing certificates for domain: ${domain} - ✓"
+    return
+  fi
+
+  mkcert "${domain}"
+  cat "$cert" > "${fullchain}"
+  cat "$( mkcert -CAROOT )/rootCA.pem" >> "${fullchain}"
+
+  echo "Generated certs and keys under $( pwd ):"
+  echo "   - Certificate: ${cert}"
+  echo "   -         Key: ${key}"
+  echo "   -   Fullchain: ${fullchain}"
+}
+
+educate_caddy_local_ca_system() {
+  echo "Caddy has built-in local CA system, enable it by running 'caddy trust' and add 'tls internal' to your Caddyfile"
+}
+
+educate_how_to_switch_to_legacy_mode() {
+  echo "
+WARNING: please switch to using *.localhost domains for local development.
+If you want to switch to legacy mode - generating self-signed certificates
+with mkcert - please run this script with option \"--legacy\""
+}
+
+setup_domain() {
+  local domain="$1"
+
+  echo
+  echo "==> Setup domain: ${domain}"
+
+  if [[ "${domain}" == *".localhost" ]]; then
+    educate_caddy_local_ca_system
+    return
+  fi
+
+  if ! is_legacy_mode; then
+    educate_how_to_switch_to_legacy_mode
+    return 1
+  fi
+
+  # We don't need mkcert anymore, as Caddy server has a local CA already
+  echo "Generate self-signed certificates with mkcert"
+  mkcert_for_domain "${domain}"
+  echo "Append domain ${domain} to /etc/hosts"
+  append_domain_to_hosts_file "${domain}"
+}
+
+setup() {
+  list_domains | while IFS= read -r domain; do
+    setup_domain "${domain}"
+  done
+}
+
+main() {
+  local legacy_option="${1:-notset}"
+
+  if [[ "$legacy_option" == "--legacy" ]]; then MODE_LEGACY=1; fi
+
+  local back_dir
+  back_dir="$( pwd )"
+
+  require_installed_command caddy
+  if is_legacy_mode; then require_installed_command mkcert; fi
+
+  setup
+}
+
+main "$@"
